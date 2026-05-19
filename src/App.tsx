@@ -334,6 +334,17 @@ function App() {
     try {
       setBusy('Opening folder')
       root = await pickDirectory('read')
+      setRootHandle(root)
+      setRootName(root.name)
+      setManifests([])
+      setFileIndex(EMPTY_INDEX)
+      setAssets([])
+      setFocusedId('')
+      setSelectedIds(new Set())
+      setPreviewAssetId('')
+      setActiveAudioId('')
+      setActiveManifestId('')
+      log('info', `已选择文件夹：${root.name}，正在检查根目录索引文件。`)
       setBusy('Indexing folder')
     } catch (error) {
       handlePickerError(error, '选择目录失败。')
@@ -348,14 +359,8 @@ function App() {
         findManifestFiles(root),
         buildFileIndex(root),
       ])
-      setRootHandle(root)
-      setRootName(root.name)
       setManifests(nextManifests)
       setFileIndex(nextIndex)
-      setSelectedIds(new Set())
-      setPreviewAssetId('')
-      setActiveAudioId('')
-      log('success', `打开资产根目录：${root.name}`)
 
       try {
         const saved = await readJsonFile<AppStateDoc>(root, STATE_FILENAME)
@@ -472,10 +477,20 @@ function App() {
         activeManifestName: INDEX_FILENAME,
       }),
     )
-    logIndexResult(result.status, result.reason, hydrated.length, true, {
-      writeError: result.writeError,
-      writeSkipped: result.writeSkipped,
-    })
+    logIndexResult(
+      result.status,
+      result.reason,
+      hydrated.length,
+      true,
+      {
+        writeError: result.writeError,
+        writeSkipped: result.writeSkipped,
+      },
+      {
+        rootName: sourceRootName,
+        sourceNames: result.doc.manifestSources.map((source) => source.name),
+      },
+    )
     setBusy('')
   }
 
@@ -485,32 +500,40 @@ function App() {
     assetCount: number,
     loadingIndex = false,
     writeState: { writeError?: string; writeSkipped?: boolean } = {},
+    context: { rootName?: string; sourceNames?: string[] } = {},
   ) => {
+    const rootLabel = context.rootName ? `${context.rootName}；` : ''
+    const sourceList = context.sourceNames?.length
+      ? context.sourceNames.join('、')
+      : INDEX_FILENAME
     if (status === 'empty') {
-      log('warn', '根目录没有找到 asset-browser-index JSON/CSV/XLSX。')
+      log(
+        'warn',
+        `已打开文件夹：${rootLabel}根目录没有找到 asset-browser-index.json、asset-browser-index.csv 或 asset-browser-index.xlsx。`,
+      )
       return
     }
     if (status === 'loaded') {
       log(
         'success',
         loadingIndex
-          ? `索引已是最新，直接读取 ${INDEX_FILENAME}。`
+          ? `已打开文件夹：${rootLabel}找到 ${INDEX_FILENAME}，读取 ${assetCount} 个资产。`
           : `${INDEX_FILENAME} 已是最新，未修改。`,
       )
       return
     }
     if (loadingIndex && (writeState.writeSkipped || writeState.writeError)) {
       log(
-        'warn',
+        writeState.writeSkipped ? 'success' : 'warn',
         writeState.writeSkipped
-          ? `${INDEX_FILENAME} 已在内存中读取，未请求写入磁盘权限。`
-          : `${INDEX_FILENAME} 已在内存中读取，但写入磁盘失败：${writeState.writeError}`,
+          ? `已打开文件夹：${rootLabel}找到 ${sourceList}，读取 ${assetCount} 个资产；${INDEX_FILENAME} 仅在内存中生成，未请求写入磁盘权限。`
+          : `已打开文件夹：${rootLabel}找到 ${sourceList}，读取 ${assetCount} 个资产；写入 ${INDEX_FILENAME} 失败：${writeState.writeError}`,
       )
       return
     }
     log(
       'success',
-      `${status === 'created' ? '生成' : '更新'} ${INDEX_FILENAME}：${reason}，${assetCount} 个资产。`,
+      `已打开文件夹：${rootLabel}找到 ${sourceList}，${status === 'created' ? '生成' : '更新'} ${INDEX_FILENAME}：${reason}，${assetCount} 个资产。`,
     )
   }
 
@@ -843,7 +866,7 @@ function App() {
                 className="primary"
                 type="button"
                 onClick={chooseRoot}
-                disabled={!supportsFileSystemAccess() || Boolean(busy)}
+                disabled={!supportsFileSystemAccess()}
               >
                 <FolderOpen data-icon="inline-start" />
                 OPEN FOLDER
@@ -1273,7 +1296,11 @@ function App() {
                   [{item.time}] {item.message}
                 </div>
               ))}
-              {activity.length === 0 && <div className="log-line info">Ready.</div>}
+              {activity.length === 0 && (
+                <div className="log-line info">
+                  请选择文件夹；打开后会报告是否找到根目录索引文件。
+                </div>
+              )}
               </ScrollArea>
             </motion.div>
           )}
