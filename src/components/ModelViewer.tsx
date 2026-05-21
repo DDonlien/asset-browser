@@ -7,6 +7,7 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import { Box, Pause, Play, RotateCcw } from 'lucide-react'
 import type { AssetRecord, IndexedFile } from '../types'
 import { dirname, getExtension, joinPath, normalizeLookupPath } from '../lib/fileSystem'
+import { loadVoxModel } from '../lib/voxModel'
 import { Button } from './ui/button'
 import {
   Select,
@@ -20,6 +21,7 @@ import {
 interface ModelViewerProps {
   asset: AssetRecord
   fileIndex: Map<string, IndexedFile>
+  onStats?: (stats: { triangles: number }) => void
 }
 
 const SUPPORT_FILES = new Set([
@@ -34,8 +36,9 @@ const SUPPORT_FILES = new Set([
   'hdr',
 ])
 
-export function ModelViewer({ asset, fileIndex }: ModelViewerProps) {
+export function ModelViewer({ asset, fileIndex, onStats }: ModelViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
+  const onStatsRef = useRef(onStats)
   const [clips, setClips] = useState<string[]>([])
   const [activeClip, setActiveClip] = useState('')
   const [playing, setPlaying] = useState(true)
@@ -59,6 +62,10 @@ export function ModelViewer({ asset, fileIndex }: ModelViewerProps) {
   useEffect(() => {
     playingRef.current = playing
   }, [playing])
+
+  useEffect(() => {
+    onStatsRef.current = onStats
+  }, [onStats])
 
   useEffect(() => {
     if (!activeClip || actionsRef.current.size === 0) return
@@ -182,6 +189,8 @@ export function ModelViewer({ asset, fileIndex }: ModelViewerProps) {
               roughness: 0.72,
             }),
           )
+        } else if (extension === 'vox') {
+          object = await loadVoxModel(assetUrl)
         } else {
           const result = await new GLTFLoader(manager).loadAsync(assetUrl)
           object = result.scene
@@ -191,6 +200,21 @@ export function ModelViewer({ asset, fileIndex }: ModelViewerProps) {
         if (disposed) return
         scene.add(object)
         frameModel(object)
+        if (onStatsRef.current) {
+          let triangles = 0
+          object.traverse((child) => {
+            if (!(child instanceof THREE.Mesh)) return
+            const geometry = child.geometry
+            if (!geometry) return
+            const index = geometry.getIndex()
+            if (index) triangles += Math.floor(index.count / 3)
+            else {
+              const positions = geometry.getAttribute('position')
+              if (positions) triangles += Math.floor(positions.count / 3)
+            }
+          })
+          onStatsRef.current({ triangles })
+        }
         const clipNames = animations.map(
           (clip) => clip.name || `Clip ${clip.uuid.slice(0, 4)}`,
         )

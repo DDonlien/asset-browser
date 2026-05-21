@@ -33,6 +33,7 @@ export type IndexSyncResult = {
 
 type SyncIndexOptions = {
   persist?: boolean
+  resolveFiles?: boolean
 }
 
 export async function syncIndexDocument(
@@ -42,7 +43,7 @@ export async function syncIndexDocument(
   fileIndex: FileIndex,
   options: SyncIndexOptions = {},
 ): Promise<IndexSyncResult> {
-  const { persist = true } = options
+  const { persist = true, resolveFiles = true } = options
   const latestManifest = getLatestManifest(manifests)
   const currentSources = createManifestSnapshots(
     latestManifest ? [latestManifest] : [],
@@ -85,7 +86,9 @@ export async function syncIndexDocument(
     throw new Error(`${INDEX_FILENAME} 不合法，并且没有找到 ${INDEX_BASENAME}.csv 或 ${INDEX_BASENAME}.xlsx。`)
   }
 
-  const assets = await parseAllManifests([latestManifest], fileIndex)
+  const assets = await parseAllManifests([latestManifest], fileIndex, {
+    resolveFiles,
+  })
   const nextDoc = createIndexDoc(rootName, currentSources, assets)
   if (!persist) {
     return {
@@ -114,9 +117,15 @@ export async function syncIndexDocument(
   }
 }
 
-export function hydrateIndexAssets(doc: AssetIndexDoc, fileIndex: FileIndex) {
+export function hydrateIndexAssets(
+  doc: AssetIndexDoc,
+  fileIndex: FileIndex,
+  options: { resolveFiles?: boolean } = {},
+) {
+  const { resolveFiles = true } = options
   return doc.assets.map((asset) => {
     if (asset.isExternal) return { ...asset, status: 'external' } satisfies AssetRecord
+    if (!resolveFiles) return { ...asset } satisfies AssetRecord
     const indexed = resolveIndexedFile(asset.normalizedPath || asset.reference, fileIndex)
     return {
       ...asset,
@@ -141,10 +150,11 @@ export function createManifestSnapshots(manifests: ManifestSource[]) {
 async function parseAllManifests(
   manifests: ManifestSource[],
   fileIndex: FileIndex,
+  options: { resolveFiles?: boolean } = {},
 ) {
   const parsed = await Promise.all(
     manifests.map(async (manifest) => {
-      const assets = await parseManifest(manifest, fileIndex)
+      const assets = await parseManifest(manifest, fileIndex, options)
       return assets.map((asset) => ({
         ...asset,
         id: stableId(`${manifest.name}:${asset.id}`),
@@ -189,6 +199,7 @@ function serializeAsset(asset: AssetRecord): SerializableAssetRecord {
     tags: asset.tags,
     metadata: asset.metadata,
     isExternal: asset.isExternal,
+    createdAt: asset.createdAt,
     updatedAt: asset.updatedAt,
   }
 }

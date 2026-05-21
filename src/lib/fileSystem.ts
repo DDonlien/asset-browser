@@ -3,6 +3,16 @@ import type { IndexedFile, ManifestSource } from '../types'
 export const INDEX_BASENAME = 'asset-browser-index'
 const MANIFEST_EXTENSIONS = new Set(['csv', 'xlsx'])
 
+type FileIndexProgress = {
+  files: number
+  directories: number
+  currentPath: string
+}
+
+type FileIndexOptions = {
+  onProgress?: (progress: FileIndexProgress) => void
+}
+
 export const supportsFileSystemAccess = () =>
   typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function'
 
@@ -51,14 +61,53 @@ export async function findManifestFiles(root: FileSystemDirectoryHandle) {
   return manifests.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-export async function buildFileIndex(root: FileSystemDirectoryHandle) {
+export async function inspectDirectoryWorkload(root: FileSystemDirectoryHandle) {
+  let files = 0
+  let directories = 1
+  let maxDepth = 0
+  const topLevelDirectories = new Set<string>()
+
+  async function walk(directory: FileSystemDirectoryHandle, parts: string[]) {
+    maxDepth = Math.max(maxDepth, parts.length)
+    for await (const [name, handle] of directory.entries()) {
+      if (name.startsWith('.')) continue
+      if (handle.kind === 'directory') {
+        directories += 1
+        if (parts.length === 0) topLevelDirectories.add(name)
+        await walk(handle as FileSystemDirectoryHandle, [...parts, name])
+        continue
+      }
+      files += 1
+    }
+  }
+
+  await walk(root, [])
+  return {
+    files,
+    directories,
+    maxDepth,
+    topLevelDirectories: Array.from(topLevelDirectories).sort(),
+  }
+}
+
+export async function buildFileIndex(
+  root: FileSystemDirectoryHandle,
+  options: FileIndexOptions = {},
+) {
   const byPath = new Map<string, IndexedFile>()
   const byBasename = new Map<string, IndexedFile[]>()
+  let directories = 1
 
   async function walk(directory: FileSystemDirectoryHandle, parts: string[]) {
     for await (const [name, handle] of directory.entries()) {
       if (name.startsWith('.')) continue
       if (handle.kind === 'directory') {
+        directories += 1
+        options.onProgress?.({
+          files: byPath.size,
+          directories,
+          currentPath: [...parts, name].join('/') || name,
+        })
         await walk(handle as FileSystemDirectoryHandle, [...parts, name])
         continue
       }
@@ -73,6 +122,13 @@ export async function buildFileIndex(root: FileSystemDirectoryHandle) {
       const list = byBasename.get(basenameKey) ?? []
       list.push(indexed)
       byBasename.set(basenameKey, list)
+      if (byPath.size === 1 || byPath.size % 100 === 0) {
+        options.onProgress?.({
+          files: byPath.size,
+          directories,
+          currentPath: path,
+        })
+      }
     }
   }
 
@@ -108,6 +164,17 @@ export async function getDirectoryForPath(
   return current
 }
 
+export async function getFileHandleAtPath(
+  root: FileSystemDirectoryHandle,
+  relativePath: string,
+) {
+  const parts = normalizeAssetPath(relativePath).split('/').filter(Boolean)
+  const filename = parts.pop()
+  if (!filename) throw new Error('缺少文件名。')
+  const directory = await getDirectoryForPath(root, parts)
+  return directory.getFileHandle(filename)
+}
+
 export async function writeJsonFile(
   directory: FileSystemDirectoryHandle,
   filename: string,
@@ -117,6 +184,18 @@ export async function writeJsonFile(
   const fileHandle = await directory.getFileHandle(filename, { create: true })
   const writable = await fileHandle.createWritable()
   await writable.write(JSON.stringify(data, null, 2))
+  await writable.close()
+}
+
+export async function writeTextFile(
+  directory: FileSystemDirectoryHandle,
+  filename: string,
+  text: string,
+) {
+  await ensurePermission(directory, 'readwrite')
+  const fileHandle = await directory.getFileHandle(filename, { create: true })
+  const writable = await fileHandle.createWritable()
+  await writable.write(text)
   await writable.close()
 }
 

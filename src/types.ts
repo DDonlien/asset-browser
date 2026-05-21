@@ -51,6 +51,7 @@ export interface AssetRecord {
   isExternal: boolean
   fileHandle?: FileSystemFileHandle
   previewUrl?: string
+  createdAt?: number
   updatedAt?: number
 }
 

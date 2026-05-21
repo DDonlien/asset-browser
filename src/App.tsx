@@ -1,41 +1,41 @@
-import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Box,
+  AlertTriangle,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   ChevronsLeft,
   ChevronsRight,
   CircleHelp,
   Download,
-  Eye,
   FileAudio,
   FileText,
   FileVideo,
   FolderOpen,
+  Grid2X2,
   Image as ImageIcon,
-  Lock,
-  MousePointerClick,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
   Star,
   Trash2,
-  Type,
-  Unlock,
+  X,
 } from 'lucide-react'
 import './App.css'
-import { InlineAudioPlayer } from './components/InlineAudioPlayer'
-import { PreviewPane } from './components/PreviewPane'
 import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import { Checkbox } from './components/ui/checkbox'
-import { Input } from './components/ui/input'
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from './components/ui/popover'
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from './components/ui/dropdown-menu'
+import { Input } from './components/ui/input'
+import { PreviewPane } from './components/PreviewPane'
 import { ScrollArea } from './components/ui/scroll-area'
 import {
   Tooltip,
@@ -47,8 +47,13 @@ import {
   buildFileIndex,
   copyFileToDirectory,
   deleteFileAtPath,
+  ensurePermission,
+  dirname,
   findManifestFiles,
   getExtension,
+  getFileHandleAtPath,
+  inspectDirectoryWorkload,
+  normalizeLookupPath,
   pickDirectory,
   readJsonFile,
   renameFileAtPath,
@@ -61,14 +66,16 @@ import {
   INDEX_FILENAME,
   syncIndexDocument,
 } from './lib/indexDocument'
-import { getKindLabel, isExternalReference, parseManifest } from './lib/manifest'
 import {
-  addAssetsToCollections,
+  GENERATED_MANIFEST_FILENAME,
+  writeGeneratedCsvManifest,
+} from './lib/generatedManifest'
+import { getKindLabel, isExternalReference } from './lib/manifest'
+import {
   addHistory,
   loadLocalState,
   normalizeState,
   recordRename,
-  removeAssetsFromCollection,
   saveLocalState,
   setAssetRating,
   setAssetTags,
@@ -88,11 +95,30 @@ import { cn } from './lib/utils'
 
 type FileIndex = Awaited<ReturnType<typeof buildFileIndex>>
 type KindFilter = AssetKind | 'all'
-type FilterGroup = 'type' | 'tag' | 'collection' | 'rating'
+type FilterGroup = 'type' | 'filetype' | 'tag' | 'collection' | 'rating'
+type SortKey =
+  | 'name'
+  | 'type'
+  | 'filetype'
+  | 'size'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'rating'
+  | 'tag'
+type SortDirection = 'asc' | 'desc'
+type SortState = { key: SortKey; direction: SortDirection } | null
+type FolderTreeNode = {
+  name: string
+  path: string
+  parentPath: string
+  count: number
+  depth: number
+  hasChildren: boolean
+}
 
-const EMPTY_INDEX: FileIndex = {
-  byPath: new Map<string, IndexedFile>(),
-  byBasename: new Map<string, IndexedFile[]>(),
+const EMPTY_FILE_INDEX: FileIndex = {
+  byPath: new Map(),
+  byBasename: new Map(),
 }
 
 const KIND_FILTERS: KindFilter[] = [
@@ -111,6 +137,8 @@ const ASSET_KIND_FILTERS = KIND_FILTERS.filter(
 const RATING_FILTERS = [5, 4, 3, 2, 1]
 
 const INDEX_SOURCE_ID = '__asset-browser-index__'
+const ASSET_ROW_HEIGHT = 56
+const ASSET_VIRTUAL_OVERSCAN = 8
 const KIND_ICON_COMPONENTS: Record<AssetKind, typeof ImageIcon> = {
   image: ImageIcon,
   audio: FileAudio,
@@ -127,40 +155,50 @@ function App() {
   const [rootName, setRootName] = useState('')
   const [targetHandle, setTargetHandle] =
     useState<FileSystemDirectoryHandle | null>(null)
-  const [manifests, setManifests] = useState<ManifestSource[]>([])
-  const [activeManifestId, setActiveManifestId] = useState('')
-  const [fileIndex, setFileIndex] = useState<FileIndex>(EMPTY_INDEX)
+  const [, setManifests] = useState<ManifestSource[]>([])
+  const [, setActiveManifestId] = useState('')
   const [assets, setAssets] = useState<AssetRecord[]>([])
   const [focusedId, setFocusedId] = useState('')
-  const [previewAssetId, setPreviewAssetId] = useState('')
-  const [activeAudioId, setActiveAudioId] = useState('')
-  const [audioPlaySignal, setAudioPlaySignal] = useState(0)
-  const [previewMode, setPreviewMode] = useState<'click' | 'hover'>('click')
-  const [previewLocked, setPreviewLocked] = useState(true)
   const [sourcePanelCollapsed, setSourcePanelCollapsed] = useState(false)
-  const [activityCollapsed, setActivityCollapsed] = useState(false)
+  const [activityCollapsed, setActivityCollapsed] = useState(true)
   const [expandedFilterGroups, setExpandedFilterGroups] = useState<FilterGroup[]>([])
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [query, setQuery] = useState('')
+  const [selectedFolderPath, setSelectedFolderPath] = useState('')
+  const [folderSectionCollapsed, setFolderSectionCollapsed] = useState(false)
+  const [collapsedFolderPaths, setCollapsedFolderPaths] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [statusFilter, setStatusFilter] = useState<AssetRecord['status'] | ''>('')
+  const [sortState, setSortState] = useState<SortState>(null)
+  const [assetScrollState, setAssetScrollState] = useState({
+    key: '',
+    top: 0,
+    height: 720,
+  })
+  const [fileIndex, setFileIndex] = useState<Map<string, IndexedFile>>(new Map())
   const [selectedKindFilters, setSelectedKindFilters] = useState<AssetKind[]>([])
+  const [selectedFileTypeFilters, setSelectedFileTypeFilters] = useState<string[]>([])
   const [selectedTagFilters, setSelectedTagFilters] = useState<string[]>([])
   const [selectedCollectionFilters, setSelectedCollectionFilters] = useState<string[]>([])
   const [selectedRatingFilters, setSelectedRatingFilters] = useState<number[]>([])
-  const [tagDrafts, setTagDrafts] = useState<Record<string, string>>({})
   const [stateDoc, setStateDoc] = useState<AppStateDoc>(() => loadLocalState())
   const [metadataReady, setMetadataReady] = useState(false)
   const [busy, setBusy] = useState('')
   const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [tagComposerAssetId, setTagComposerAssetId] = useState('')
+  const [tagComposerValue, setTagComposerValue] = useState('')
+  const [tableScrollState, setTableScrollState] = useState({
+    canScrollLeft: false,
+    canScrollRight: false,
+  })
   const lastMetadataSaveRef = useRef('')
+  const resolvingAssetIdsRef = useRef(new Set<string>())
+  const tableScrollRef = useRef<HTMLDivElement | null>(null)
 
-  const activeManifest = manifests.find((item) => item.id === activeManifestId)
-  const activeSourceName =
-    activeManifestId === INDEX_SOURCE_ID
-      ? INDEX_FILENAME
-      : activeManifest?.name
   const templateAssets = useMemo(() => createTemplateAssets(), [])
   const sourceAssets = assets.length > 0 ? assets : templateAssets
-  const previewAsset = sourceAssets.find((asset) => asset.id === previewAssetId)
+  const focusedAsset = sourceAssets.find((asset) => asset.id === focusedId)
   const tagOptions = useMemo(() => {
     const tags = new Set<string>()
     sourceAssets.forEach((asset) => {
@@ -169,6 +207,27 @@ function App() {
     })
     return Array.from(tags).sort((a, b) => a.localeCompare(b))
   }, [sourceAssets, stateDoc.assetTags])
+
+  const fileTypeOptions = useMemo(() => {
+    const extensions = new Set<string>()
+    sourceAssets.forEach((asset) => {
+      if (selectedKindFilters.length > 0 && !selectedKindFilters.includes(asset.kind)) {
+        return
+      }
+      const extension = String(asset.extension ?? '')
+        .replace(/^\./, '')
+        .trim()
+        .toLocaleLowerCase()
+      if (!extension) return
+      extensions.add(extension)
+    })
+    return Array.from(extensions).sort((a, b) => a.localeCompare(b))
+  }, [sourceAssets, selectedKindFilters])
+
+  const activeFileTypeFilters = useMemo(
+    () => selectedFileTypeFilters.filter((extension) => fileTypeOptions.includes(extension)),
+    [fileTypeOptions, selectedFileTypeFilters],
+  )
 
   const collectionAssetIds = useMemo(() => {
     const selected = stateDoc.favorites.filter((collection) =>
@@ -184,6 +243,16 @@ function App() {
       .filter(Boolean)
 
     return sourceAssets.filter((asset) => {
+      if (selectedFolderPath) {
+        const assetFolder = asset.folder || 'root'
+        const inFolder =
+          selectedFolderPath === 'root'
+            ? assetFolder === 'root'
+            : assetFolder === selectedFolderPath ||
+              assetFolder.startsWith(`${selectedFolderPath}/`)
+        if (!inFolder) return false
+      }
+      if (statusFilter && asset.status !== statusFilter) return false
       if (
         selectedKindFilters.length > 0 &&
         !selectedKindFilters.includes(asset.kind)
@@ -212,12 +281,24 @@ function App() {
       ) {
         return false
       }
+      if (
+        activeFileTypeFilters.length > 0 &&
+        !activeFileTypeFilters.includes(
+          String(asset.extension ?? '')
+            .replace(/^\./, '')
+            .trim()
+            .toLocaleLowerCase(),
+        )
+      ) {
+        return false
+      }
       if (terms.length === 0) return true
       const haystack = [
         asset.name,
         asset.reference,
         asset.normalizedPath,
         asset.folder,
+        asset.status,
         asset.typeLabel,
         asset.tags.join(' '),
         stateDoc.assetTags[asset.id]?.join(' ') ?? '',
@@ -232,30 +313,264 @@ function App() {
     selectedKindFilters,
     selectedCollectionFilters,
     collectionAssetIds,
+    selectedFolderPath,
     selectedTagFilters,
     selectedRatingFilters,
+    activeFileTypeFilters,
     query,
+    statusFilter,
     stateDoc.assetRatings,
     stateDoc.assetTags,
   ])
 
-  const previewableAsset =
-    previewAsset && isPreviewPaneAsset(previewAsset) ? previewAsset : undefined
-  const showPreviewPane = previewLocked || Boolean(previewableAsset)
-  const workspaceClassName = cn(
-    'workspace',
-    showPreviewPane ? 'has-preview' : 'is-list-only',
+  const sourceOrder = useMemo(() => {
+    const order = new Map<string, number>()
+    sourceAssets.forEach((asset, index) => {
+      order.set(asset.id, index)
+    })
+    return order
+  }, [sourceAssets])
+
+  const toggleSort = (key: SortKey) => {
+    setSortState((current) => {
+      if (!current || current.key !== key) return { key, direction: 'asc' }
+      if (current.direction === 'asc') return { key, direction: 'desc' }
+      return null
+    })
+  }
+
+  const sortIndicator = (key: SortKey) => {
+    if (!sortState || sortState.key !== key) return null
+    return sortState.direction === 'asc' ? <ChevronUp /> : <ChevronDown />
+  }
+
+  const visibleAssets = useMemo(() => {
+    if (!sortState) return filteredAssets
+
+    const getDisplayTags = (asset: AssetRecord) =>
+      Array.from(
+        new Set([...asset.tags, ...(stateDoc.assetTags[asset.id] ?? [])]),
+      )
+
+    const compareText = (a: string, b: string) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+
+    const compareOptionalNumber = (
+      a: number | undefined,
+      b: number | undefined,
+    ) => {
+      if (a == null && b == null) return 0
+      if (a == null) return 1
+      if (b == null) return -1
+      return a - b
+    }
+
+    const compareOptionalText = (a: string | undefined, b: string | undefined) => {
+      if (!a && !b) return 0
+      if (!a) return 1
+      if (!b) return -1
+      return compareText(a, b)
+    }
+
+    const direction = sortState.direction === 'asc' ? 1 : -1
+
+    const sorted = [...filteredAssets].sort((left, right) => {
+      let result = 0
+      switch (sortState.key) {
+        case 'name':
+          result = compareText(left.name, right.name)
+          break
+        case 'type':
+          result = compareText(left.kind, right.kind)
+          break
+        case 'filetype':
+          result = compareOptionalText(left.extension, right.extension)
+          break
+        case 'size':
+          result = compareOptionalNumber(left.size, right.size)
+          break
+        case 'createdAt':
+          result = compareOptionalNumber(left.createdAt, right.createdAt)
+          break
+        case 'updatedAt':
+          result = compareOptionalNumber(left.updatedAt, right.updatedAt)
+          break
+        case 'rating':
+          result = (stateDoc.assetRatings[left.id] ?? 0) - (stateDoc.assetRatings[right.id] ?? 0)
+          break
+        case 'tag':
+          result = compareText(getDisplayTags(left).join(' '), getDisplayTags(right).join(' '))
+          break
+      }
+
+      if (result !== 0) return result * direction
+      return (sourceOrder.get(left.id) ?? 0) - (sourceOrder.get(right.id) ?? 0)
+    })
+
+    return sorted
+  }, [filteredAssets, sortState, sourceOrder, stateDoc.assetRatings, stateDoc.assetTags])
+
+  const workspaceClassName = cn('workspace', 'is-list-only')
+  const visibleAssetIds = useMemo(
+    () => visibleAssets.map((asset) => asset.id),
+    [visibleAssets],
   )
-  const filteredAssetIds = useMemo(
-    () => filteredAssets.map((asset) => asset.id),
-    [filteredAssets],
+  const virtualScopeKey = [
+    query,
+    selectedFolderPath,
+    statusFilter,
+    selectedKindFilters.join(','),
+    activeFileTypeFilters.join(','),
+    selectedCollectionFilters.join(','),
+    selectedTagFilters.join(','),
+    selectedRatingFilters.join(','),
+    sortState ? `${sortState.key}:${sortState.direction}` : '',
+    sourceAssets.length,
+  ].join('|')
+  const assetScrollTop =
+    assetScrollState.key === virtualScopeKey ? assetScrollState.top : 0
+  const assetViewportHeight =
+    assetScrollState.key === virtualScopeKey ? assetScrollState.height : 720
+  const tableScrollStateForScope =
+    assetScrollState.key === virtualScopeKey
+      ? tableScrollState
+      : { canScrollLeft: false, canScrollRight: false }
+  const virtualStartIndex = Math.max(
+    0,
+    Math.floor(assetScrollTop / ASSET_ROW_HEIGHT) - ASSET_VIRTUAL_OVERSCAN,
   )
-  const selectedFilteredCount = filteredAssetIds.filter((id) =>
+  const virtualEndIndex = Math.min(
+    visibleAssets.length,
+    Math.ceil((assetScrollTop + assetViewportHeight) / ASSET_ROW_HEIGHT) +
+      ASSET_VIRTUAL_OVERSCAN,
+  )
+  const renderedAssets = useMemo(
+    () => visibleAssets.slice(virtualStartIndex, virtualEndIndex),
+    [virtualEndIndex, virtualStartIndex, visibleAssets],
+  )
+  const virtualTopHeight = virtualStartIndex * ASSET_ROW_HEIGHT
+  const virtualBottomHeight =
+    Math.max(visibleAssets.length - virtualEndIndex, 0) * ASSET_ROW_HEIGHT
+  const selectedAssets = useMemo(
+    () => sourceAssets.filter((asset) => selectedIds.has(asset.id)),
+    [selectedIds, sourceAssets],
+  )
+  const folderTreeNodes = useMemo(() => {
+    const folderCounts = new Map<string, number>()
+    const folderPaths = new Set<string>()
+    const childrenByParent = new Map<string, string[]>()
+
+    const getParentPath = (path: string) => {
+      if (path === 'root') return ''
+      const parts = path.split('/').filter(Boolean)
+      if (parts.length <= 1) return ''
+      return parts.slice(0, -1).join('/')
+    }
+
+    const addFolderPath = (path: string) => {
+      folderPaths.add(path)
+      const parentPath = getParentPath(path)
+      if (!parentPath) return
+      const children = childrenByParent.get(parentPath) ?? []
+      if (!children.includes(path)) {
+        children.push(path)
+        childrenByParent.set(parentPath, children)
+      }
+    }
+
+    sourceAssets.forEach((asset) => {
+      const folder = asset.folder || 'root'
+
+      if (folder === 'root') {
+        addFolderPath('root')
+        folderCounts.set('root', (folderCounts.get('root') ?? 0) + 1)
+        return
+      }
+
+      const parts = folder.split('/').filter(Boolean)
+      parts.forEach((_, index) => {
+        const path = parts.slice(0, index + 1).join('/')
+        addFolderPath(path)
+        folderCounts.set(path, (folderCounts.get(path) ?? 0) + 1)
+      })
+    })
+
+    const makeNode = (path: string): FolderTreeNode => {
+      const parts = path === 'root' ? ['root'] : path.split('/').filter(Boolean)
+      return {
+        name: parts[parts.length - 1] ?? path,
+        path,
+        parentPath: getParentPath(path),
+        count: folderCounts.get(path) ?? 0,
+        depth: path === 'root' ? 0 : parts.length - 1,
+        hasChildren: (childrenByParent.get(path)?.length ?? 0) > 0,
+      }
+    }
+
+    const sortPaths = (left: string, right: string) => {
+      if (left === 'root') return -1
+      if (right === 'root') return 1
+      return left.localeCompare(right, undefined, {
+        numeric: true,
+        sensitivity: 'base',
+      })
+    }
+
+    const sortedChildrenByParent = new Map(
+      Array.from(childrenByParent, ([parent, children]) => [
+        parent,
+        [...children].sort(sortPaths),
+      ]),
+    )
+    const topLevelPaths = Array.from(folderPaths)
+      .filter((path) => !getParentPath(path))
+      .sort(sortPaths)
+    const orderedNodes: FolderTreeNode[] = []
+    const appendPath = (path: string) => {
+      orderedNodes.push(makeNode(path))
+      sortedChildrenByParent.get(path)?.forEach(appendPath)
+    }
+
+    topLevelPaths.forEach(appendPath)
+    return orderedNodes
+  }, [sourceAssets])
+  const folderNodeByPath = useMemo(
+    () => new Map(folderTreeNodes.map((node) => [node.path, node])),
+    [folderTreeNodes],
+  )
+  const visibleFolderTreeNodes = useMemo(() => {
+    if (folderSectionCollapsed) return []
+
+    return folderTreeNodes.filter((node) => {
+      let parentPath = node.parentPath
+      while (parentPath) {
+        if (collapsedFolderPaths.has(parentPath)) return false
+        parentPath = folderNodeByPath.get(parentPath)?.parentPath ?? ''
+      }
+      return true
+    })
+  }, [
+    collapsedFolderPaths,
+    folderNodeByPath,
+    folderSectionCollapsed,
+    folderTreeNodes,
+  ])
+  const toggleFolderCollapsed = useCallback((path: string) => {
+    setCollapsedFolderPaths((current) => {
+      const next = new Set(current)
+      if (next.has(path)) {
+        next.delete(path)
+      } else {
+        next.add(path)
+      }
+      return next
+    })
+  }, [])
+  const selectedFilteredCount = visibleAssetIds.filter((id) =>
     selectedIds.has(id),
   ).length
   const allFilteredSelected =
-    filteredAssetIds.length > 0 &&
-    selectedFilteredCount === filteredAssetIds.length
+    visibleAssetIds.length > 0 && selectedFilteredCount === visibleAssetIds.length
 
   useEffect(() => {
     saveLocalState(stateDoc)
@@ -337,15 +652,13 @@ function App() {
       setRootHandle(root)
       setRootName(root.name)
       setManifests([])
-      setFileIndex(EMPTY_INDEX)
       setAssets([])
       setFocusedId('')
       setSelectedIds(new Set())
-      setPreviewAssetId('')
-      setActiveAudioId('')
       setActiveManifestId('')
+      setFileIndex(new Map())
       log('info', `已选择文件夹：${root.name}，正在检查根目录索引文件。`)
-      setBusy('Indexing folder')
+      setBusy('Checking index')
     } catch (error) {
       handlePickerError(error, '选择目录失败。')
       setBusy('')
@@ -355,12 +668,10 @@ function App() {
     try {
       setMetadataReady(false)
       lastMetadataSaveRef.current = ''
-      const [nextManifests, nextIndex] = await Promise.all([
-        findManifestFiles(root),
-        buildFileIndex(root),
-      ])
+      const nextManifests = await findManifestFiles(root)
+      const nextIndex = EMPTY_FILE_INDEX
       setManifests(nextManifests)
-      setFileIndex(nextIndex)
+      setFileIndex(new Map())
 
       try {
         const saved = await readJsonFile<AppStateDoc>(root, STATE_FILENAME)
@@ -376,6 +687,7 @@ function App() {
 
       await loadIndexForRoot(root, nextManifests, nextIndex, root.name, {
         persistIndex: false,
+        resolveFiles: false,
       })
       setMetadataReady(true)
     } catch (error) {
@@ -390,85 +702,25 @@ function App() {
     }
   }
 
-  const reloadActiveManifest = async () => {
-    if (!rootHandle) return
-    try {
-      setBusy('Reloading')
-      const [nextManifests, nextIndex] = await Promise.all([
-        findManifestFiles(rootHandle),
-        buildFileIndex(rootHandle),
-      ])
-      setManifests(nextManifests)
-      setFileIndex(nextIndex)
-      if (activeManifestId === INDEX_SOURCE_ID || !activeManifestId) {
-        await loadIndexForRoot(rootHandle, nextManifests, nextIndex, rootName)
-        return
-      }
-      const syncResult = await syncIndexDocument(
-        rootHandle,
-        rootName,
-        nextManifests,
-        nextIndex,
-      )
-      logIndexResult(syncResult.status, syncResult.reason, syncResult.doc.assets.length)
-      const manifest =
-        nextManifests.find((item) => item.id === activeManifestId) ??
-        nextManifests[0]
-      if (!manifest) {
-        setAssets([])
-        setFocusedId('')
-        return
-      }
-      setActiveManifestId(manifest.id)
-      await loadManifest(manifest, nextIndex, rootName)
-    } catch (error) {
-      log('fail', error instanceof Error ? error.message : '重新读取失败。')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const loadManifest = async (
-    manifest: ManifestSource,
-    index: FileIndex,
-    sourceRootName = rootName,
-  ) => {
-    setBusy(`Reading ${manifest.name}`)
-    const parsed = await parseManifest(manifest, index)
-    const hydrated = await Promise.all(parsed.map(hydrateAsset))
-    setAssets(hydrated)
-    setFocusedId(hydrated[0]?.id ?? '')
-    setPreviewAssetId('')
-    setActiveAudioId('')
-    setStateDoc((current) =>
-      touchState({
-        ...current,
-        sourceRootName,
-        activeManifestName: manifest.name,
-      }),
-    )
-    log('success', `读取清单：${manifest.name}，${hydrated.length} 个资产。`)
-    setBusy('')
-  }
-
   const loadIndexForRoot = async (
     root: FileSystemDirectoryHandle,
     nextManifests: ManifestSource[],
     index: FileIndex,
     sourceRootName: string,
-    options: { persistIndex?: boolean } = {},
+    options: { persistIndex?: boolean; resolveFiles?: boolean } = {},
   ) => {
     setBusy(`Checking ${INDEX_FILENAME}`)
     const result = await syncIndexDocument(root, sourceRootName, nextManifests, index, {
       persist: options.persistIndex ?? true,
+      resolveFiles: options.resolveFiles ?? true,
     })
     const hydrated = await Promise.all(
-      hydrateIndexAssets(result.doc, index).map(hydrateAsset),
+      hydrateIndexAssets(result.doc, index, {
+        resolveFiles: options.resolveFiles ?? true,
+      }).map(hydrateAsset),
     )
     setAssets(hydrated)
-    setFocusedId(hydrated[0]?.id ?? '')
-    setPreviewAssetId('')
-    setActiveAudioId('')
+    setFocusedId('')
     setActiveManifestId(INDEX_SOURCE_ID)
     setStateDoc((current) =>
       touchState({
@@ -545,12 +797,36 @@ function App() {
         ...asset,
         size: file.size,
         mime: file.type,
+        createdAt: asset.createdAt ?? file.lastModified,
         updatedAt: file.lastModified,
       }
     } catch {
       return { ...asset, status: 'missing' }
     }
   }
+
+  const readAssetFileHandle = useCallback(async (asset: AssetRecord) => {
+    if (!rootHandle || asset.fileHandle || asset.isExternal) return asset
+    const targetPath = asset.normalizedPath || asset.reference
+    if (!targetPath) return asset
+
+    try {
+      const fileHandle = await getFileHandleAtPath(rootHandle, targetPath)
+      const file = await fileHandle.getFile()
+      const nextAsset: AssetRecord = {
+        ...asset,
+        fileHandle,
+        status: 'ready',
+        size: file.size,
+        mime: file.type,
+        createdAt: asset.createdAt ?? file.lastModified,
+        updatedAt: file.lastModified,
+      }
+      return nextAsset
+    } catch {
+      return { ...asset, status: 'missing' } satisfies AssetRecord
+    }
+  }, [rootHandle])
 
   const focusAsset = (asset: AssetRecord) => {
     setFocusedId(asset.id)
@@ -570,30 +846,20 @@ function App() {
     setSelectedIds((current) => {
       const next = new Set(current)
       if (allFilteredSelected) {
-        filteredAssetIds.forEach((id) => next.delete(id))
+        visibleAssetIds.forEach((id) => next.delete(id))
       } else {
-        filteredAssetIds.forEach((id) => next.add(id))
+        visibleAssetIds.forEach((id) => next.add(id))
       }
       return next
     })
   }
 
-  const requestAudioPlayback = (assetId: string) => {
-    setPreviewAssetId('')
-    setActiveAudioId(assetId)
-    setAudioPlaySignal((value) => value + 1)
-  }
-
   const activateAsset = (asset: AssetRecord) => {
-    focusAsset(asset)
-    if (asset.kind === 'audio') {
-      requestAudioPlayback(asset.id)
+    if (focusedId === asset.id) {
+      setFocusedId('')
       return
     }
-    setActiveAudioId('')
-    if (previewMode === 'click') {
-      setPreviewAssetId(isPreviewPaneAsset(asset) ? asset.id : '')
-    }
+    focusAsset(asset)
   }
 
   const deleteAsset = async (asset: AssetRecord) => {
@@ -609,8 +875,6 @@ function App() {
         return next
       })
       setFocusedId((current) => (current === asset.id ? '' : current))
-      setPreviewAssetId((current) => (current === asset.id ? '' : current))
-      setActiveAudioId((current) => (current === asset.id ? '' : current))
       log('success', `删除完成：${asset.name}`)
     } catch (error) {
       log('fail', error instanceof Error ? error.message : '删除失败。')
@@ -620,36 +884,40 @@ function App() {
   }
 
   const renameAsset = async (asset: AssetRecord) => {
-    if (!rootHandle || asset.metadata.source === 'template') return
-    if (!asset || !asset.fileHandle) return
-    const currentName = asset.normalizedPath.split('/').pop() || asset.name
-    const nextName = window.prompt('新的文件名', currentName)
-    if (!nextName || nextName === currentName) return
+    if (!rootHandle || !asset.fileHandle || asset.status !== 'ready') return
+    const proposed = window.prompt('重命名为：', asset.name)
+    if (proposed == null) return
+    const nextName = proposed.trim()
+    if (!nextName || nextName === asset.name) return
+
+    if (assets.length === 0) {
+      log('warn', '模板资源暂不支持重命名。请先打开真实文件夹。')
+      return
+    }
+
     try {
       setBusy('Renaming')
       const nextPath = await renameFileAtPath(rootHandle, asset.normalizedPath, nextName)
       const nextIndex = await buildFileIndex(rootHandle)
-      setFileIndex(nextIndex)
-      const indexed = nextIndex.byPath.get(nextPath.toLocaleLowerCase())
+      const nextHandle = nextIndex.byPath.get(normalizeLookupPath(nextPath))?.handle
+      setFileIndex(nextIndex.byPath)
       setAssets((items) =>
         items.map((item) =>
           item.id === asset.id
             ? {
                 ...item,
-                name: stripExtension(nextName),
+                name: nextName,
                 reference: nextPath,
                 normalizedPath: nextPath,
-                folder: nextPath.includes('/')
-                  ? nextPath.split('/').slice(0, -1).join('/')
-                  : 'root',
+                folder: dirname(nextPath) || 'root',
                 extension: getExtension(nextPath),
-                fileHandle: indexed?.handle,
+                fileHandle: nextHandle,
               }
             : item,
         ),
       )
       setStateDoc((current) => recordRename(current, asset, nextPath))
-      log('success', `重命名：${currentName} -> ${nextName}`)
+      log('success', `重命名完成：${asset.name} -> ${nextName}`)
     } catch (error) {
       log('fail', error instanceof Error ? error.message : '重命名失败。')
     } finally {
@@ -694,30 +962,6 @@ function App() {
     }
   }
 
-  const isAssetInCollection = (assetId: string, collectionId: string) => {
-    return Boolean(
-      stateDoc.favorites
-        .find((collection) => collection.id === collectionId)
-        ?.entries.some((entry) => entry.id === assetId),
-    )
-  }
-
-  const toggleFavoriteCollection = (asset: AssetRecord, collectionId: string) => {
-    const collection = stateDoc.favorites.find((item) => item.id === collectionId)
-    if (!collection) return
-    if (isAssetInCollection(asset.id, collection.id)) {
-      setStateDoc((current) =>
-        removeAssetsFromCollection(current, [asset.id], collection.id),
-      )
-      log('success', `已从 ${collection.name} 移除：${asset.name}`)
-      return
-    }
-    setStateDoc((current) =>
-      addAssetsToCollections(current, [asset], [collection.id]),
-    )
-    log('success', `收藏到 ${collection.name}：${asset.name}`)
-  }
-
   const updateAssetRating = (asset: AssetRecord, rating: number) => {
     const current = stateDoc.assetRatings[asset.id] ?? 0
     const nextRating = current === rating ? 0 : rating
@@ -737,26 +981,199 @@ function App() {
     })
   }
 
-  const addAssetTag = (asset: AssetRecord, value: string) => {
-    const nextTag = value.trim()
-    if (!nextTag) return
-    const currentTags = stateDoc.assetTags[asset.id] ?? []
-    if ([...asset.tags, ...currentTags].includes(nextTag)) {
-      setTagDrafts((current) => ({ ...current, [asset.id]: '' }))
-      return
-    }
-    const nextTags = [...currentTags, nextTag]
-    setStateDoc((current) => setAssetTags(current, asset, nextTags))
-    setTagDrafts((current) => ({ ...current, [asset.id]: '' }))
-    log('success', `新增标签：${asset.name} -> ${nextTag}`)
-  }
-
   const removeAssetTag = (asset: AssetRecord, tag: string) => {
     const currentTags = stateDoc.assetTags[asset.id] ?? []
     if (!currentTags.includes(tag)) return
     const nextTags = currentTags.filter((item) => item !== tag)
     setStateDoc((current) => setAssetTags(current, asset, nextTags))
     log('success', `移除标签：${asset.name} -> ${tag}`)
+  }
+
+  const addAssetTag = (asset: AssetRecord, tag: string) => {
+    const nextTag = tag.trim()
+    if (!nextTag) return
+    const currentTags = stateDoc.assetTags[asset.id] ?? []
+    const nextTags = Array.from(new Set([...currentTags, nextTag]))
+    setStateDoc((current) => setAssetTags(current, asset, nextTags))
+    log('success', `新增标签：${asset.name} -> ${nextTag}`)
+  }
+
+  const updateTableScrollState = () => {
+    const element = tableScrollRef.current
+    if (!element) return
+    const maxScrollLeft = element.scrollWidth - element.clientWidth
+    setTableScrollState({
+      canScrollLeft: element.scrollLeft > 2,
+      canScrollRight: element.scrollLeft < maxScrollLeft - 2,
+    })
+  }
+
+  useEffect(() => {
+    updateTableScrollState()
+  }, [focusedAsset, visibleAssets.length])
+
+  useLayoutEffect(() => {
+    const element = tableScrollRef.current
+    if (!element) return
+
+    element.scrollLeft = 0
+    const id = window.requestAnimationFrame(() => {
+      setAssetScrollState({
+        key: virtualScopeKey,
+        top: 0,
+        height: element.clientHeight || 720,
+      })
+      updateTableScrollState()
+    })
+    return () => window.cancelAnimationFrame(id)
+  }, [virtualScopeKey])
+
+  useEffect(() => {
+    const element = tableScrollRef.current
+    if (!element) return
+    const id = window.requestAnimationFrame(() => {
+      updateTableScrollState()
+    })
+    return () => window.cancelAnimationFrame(id)
+  }, [])
+
+  useEffect(() => {
+    if (!rootHandle || assets.length === 0) return
+
+    const candidates = renderedAssets.filter((asset) => {
+      if (asset.fileHandle || asset.isExternal || asset.status === 'missing') {
+        return false
+      }
+      if (!asset.normalizedPath && !asset.reference) return false
+      if (resolvingAssetIdsRef.current.has(asset.id)) return false
+      return true
+    })
+
+    if (candidates.length === 0) return
+
+    let cancelled = false
+    candidates.forEach((asset) => resolvingAssetIdsRef.current.add(asset.id))
+
+    void Promise.all(candidates.map((asset) => readAssetFileHandle(asset)))
+      .then((resolvedAssets) => {
+        if (cancelled) return
+        const resolvedById = new Map(
+          resolvedAssets.map((asset) => [asset.id, asset]),
+        )
+        setAssets((items) =>
+          items.map((item) => resolvedById.get(item.id) ?? item),
+        )
+      })
+      .finally(() => {
+        candidates.forEach((asset) => resolvingAssetIdsRef.current.delete(asset.id))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [assets.length, readAssetFileHandle, renderedAssets, rootHandle])
+
+  const resetFilters = () => {
+    setQuery('')
+    setSelectedFolderPath('')
+    setStatusFilter('')
+    setSelectedKindFilters([])
+    setSelectedFileTypeFilters([])
+    setSelectedTagFilters([])
+    setSelectedCollectionFilters([])
+    setSelectedRatingFilters([])
+    setExpandedFilterGroups([])
+  }
+
+  const generateIndex = async () => {
+    if (!rootHandle) {
+      await chooseRoot()
+      return
+    }
+
+    try {
+      setBusy('Generating index')
+      log('info', `开始生成索引：先检查根目录 ${GENERATED_MANIFEST_FILENAME}。`)
+      const canWrite = await ensurePermission(rootHandle, 'readwrite')
+      if (!canWrite) throw new Error('没有获得该文件夹的写入权限。')
+      let nextManifests = await findManifestFiles(rootHandle)
+      let nextIndex = EMPTY_FILE_INDEX
+      let shouldResolveFiles = false
+
+      if (nextManifests.length === 0) {
+        log('info', '根目录没有 CSV / Excel 索引，开始快速检查文件夹层级。')
+        const workload = await inspectDirectoryWorkload(rootHandle)
+        const topLevelPreview = workload.topLevelDirectories.slice(0, 4).join('、')
+        log(
+          'info',
+          `预检查完成：约 ${workload.files} 个文件，${workload.directories} 个文件夹，最大深度 ${workload.maxDepth} 层${
+            topLevelPreview ? `；一级目录：${topLevelPreview}` : ''
+          }。`,
+        )
+        log('info', '开始扫描资产路径并建立索引。')
+        let lastScanLogFiles = 0
+        let lastScanLogDirectories = 0
+        nextIndex = await buildFileIndex(rootHandle, {
+          onProgress: (progress) => {
+            const shouldLog =
+              progress.files === 1 ||
+              progress.files === workload.files ||
+              progress.files - lastScanLogFiles >= 100 ||
+              progress.directories - lastScanLogDirectories >= 25
+            if (!shouldLog) return
+            lastScanLogFiles = progress.files
+            lastScanLogDirectories = progress.directories
+            log(
+              'info',
+              `扫描进度：已发现 ${progress.files}/${workload.files} 个文件，${progress.directories} 个文件夹。`,
+            )
+          },
+        })
+        log('info', `扫描完成：准备写入 ${GENERATED_MANIFEST_FILENAME}。`)
+        const generatedCount = await writeGeneratedCsvManifest(
+          rootHandle,
+          nextIndex,
+          {
+            onProgress: (progress) => {
+              log(
+                'info',
+                `CSV 生成进度：${progress.processed}/${progress.total}。`,
+              )
+            },
+          },
+        )
+        log(
+          'success',
+          `生成 ${GENERATED_MANIFEST_FILENAME}：扫描到 ${generatedCount} 个资产。`,
+        )
+        nextManifests = await findManifestFiles(rootHandle)
+        shouldResolveFiles = true
+      } else {
+        log('info', `找到 ${nextManifests.map((item) => item.name).join('、')}，将基于现有索引更新 JSON。`)
+      }
+
+      setManifests(nextManifests)
+      setFileIndex(shouldResolveFiles ? nextIndex.byPath : new Map())
+      await loadIndexForRoot(rootHandle, nextManifests, nextIndex, rootName, {
+        resolveFiles: shouldResolveFiles,
+      })
+    } catch (error) {
+      log('fail', error instanceof Error ? error.message : '生成索引失败。')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const downloadSelectedAssets = async () => {
+    for (const asset of selectedAssets) {
+      await downloadAsset(asset)
+    }
+  }
+
+  const deleteSelectedAssets = async () => {
+    for (const asset of selectedAssets) {
+      await deleteAsset(asset)
+    }
   }
 
   const loadMetadataManually = async () => {
@@ -790,19 +1207,7 @@ function App() {
           aria-label={sourcePanelCollapsed ? '展开 Asset Browser' : '收起 Asset Browser'}
           onClick={() => setSourcePanelCollapsed((value) => !value)}
         >
-          <span className="nav-monogram">AB</span>
-          <span>Panel</span>
-          <span className="nav-toggle-mark" aria-hidden="true">
-            {sourcePanelCollapsed ? (
-              <ChevronsRight />
-            ) : (
-              <ChevronsLeft />
-            )}
-          </span>
-        </Button>
-        <Button className="nav-item is-active" variant="ghost" type="button" title="Assets">
-          <ImageIcon />
-          <span>Assets</span>
+          {sourcePanelCollapsed ? <ChevronsRight /> : <ChevronsLeft />}
         </Button>
       </nav>
 
@@ -816,470 +1221,731 @@ function App() {
         transition={{ duration: 0.16, ease: 'easeOut' }}
       >
         <div className="brand">
-          <div>
-            <h1>Asset Browser</h1>
-            <p>Art + implementation library</p>
-          </div>
-          <div className="brand-actions">
-            <ToolbarIconButton
-              label="收起资源面板"
-              onClick={() => setSourcePanelCollapsed(true)}
-            >
-              <ChevronsLeft />
-            </ToolbarIconButton>
-            <ToolbarIconButton
-              label={previewMode === 'click' ? '点击预览' : 'Hover 预览'}
-              active={previewMode === 'hover'}
-              onClick={() =>
-                setPreviewMode((mode) => (mode === 'click' ? 'hover' : 'click'))
-              }
-            >
-              {previewMode === 'click' ? (
-                <MousePointerClick />
-              ) : (
-                <Eye />
-              )}
-            </ToolbarIconButton>
-            <ToolbarIconButton
-              label={previewLocked ? '预览窗格已锁定' : '锁定预览窗格'}
-              active={previewLocked}
-              onClick={() => setPreviewLocked((value) => !value)}
-            >
-              {previewLocked ? <Lock /> : <Unlock />}
-            </ToolbarIconButton>
-            <ToolbarIconButton
-              label="重新读取"
-              onClick={reloadActiveManifest}
-              disabled={!rootHandle || Boolean(busy)}
-            >
-              <RefreshCw />
-            </ToolbarIconButton>
-          </div>
+          {rootHandle ? (
+            <>
+              <div className="open-folder-title">
+                <FolderOpen data-icon="inline-start" />
+                <span>{rootName}</span>
+              </div>
+              <div className="brand-actions">
+                <ToolbarIconButton
+                  label="打开新文件夹"
+                  onClick={chooseRoot}
+                  disabled={!supportsFileSystemAccess() || Boolean(busy)}
+                >
+                  <FolderOpen />
+                </ToolbarIconButton>
+                <ToolbarIconButton
+                  label="收起资源面板"
+                  onClick={() => setSourcePanelCollapsed(true)}
+                >
+                  <ChevronsLeft />
+                </ToolbarIconButton>
+              </div>
+            </>
+          ) : (
+            <>
+              <Button
+                className="open-folder-wide"
+                type="button"
+                onClick={chooseRoot}
+                disabled={!supportsFileSystemAccess() || Boolean(busy)}
+              >
+                <FolderOpen data-icon="inline-start" />
+                Open folder
+              </Button>
+              <ToolbarIconButton
+                label="收起资源面板"
+                onClick={() => setSourcePanelCollapsed(true)}
+              >
+                <ChevronsLeft />
+              </ToolbarIconButton>
+            </>
+          )}
         </div>
 
         <ScrollArea className="panel-body">
-          <section className="drop">
-            <strong>{rootName || 'No folder selected'}</strong>
-            <span>{activeSourceName || 'CSV / XLSX manifest'}</span>
-            <div className="folder-actions">
-              <Button
-                className="primary"
-                type="button"
-                onClick={chooseRoot}
-                disabled={!supportsFileSystemAccess()}
-              >
-                <FolderOpen data-icon="inline-start" />
-                OPEN FOLDER
-              </Button>
-              {rootHandle && assets.length === 0 && (
-                <Button type="button" variant="outline" onClick={loadMetadataManually}>
-                  META
-                </Button>
+          <section className="panel-nav-section">
+            <Button
+              className={cn(
+                'panel-nav-row',
+                !selectedFolderPath &&
+                  !statusFilter &&
+                  selectedCollectionFilters.length === 0 &&
+                  'is-active',
               )}
-            </div>
-            {!supportsFileSystemAccess() && (
-              <span className="warn-text">Chrome / Edge required</span>
-            )}
+              variant="ghost"
+              type="button"
+              onClick={resetFilters}
+            >
+              <Grid2X2 />
+              <span>All Assets</span>
+              <strong>{sourceAssets.length}</strong>
+            </Button>
+            <Button
+              className={cn('panel-nav-row', statusFilter === 'missing' && 'is-active')}
+              variant="ghost"
+              type="button"
+              onClick={() => {
+                setSelectedFolderPath('')
+                setStatusFilter((current) => (current === 'missing' ? '' : 'missing'))
+              }}
+            >
+              <AlertTriangle />
+              <span>Missing Source</span>
+              <strong>{sourceAssets.filter((a) => a.status === 'missing').length}</strong>
+            </Button>
+            {busy && <Badge className="busy-chip" variant="secondary">{busy}</Badge>}
           </section>
 
-          <section className="section">
-            <div className="section-head">
-              <h2>Production</h2>
-              {busy && <Badge className="busy-chip" variant="secondary">{busy}</Badge>}
-            </div>
-            <div className="stats-grid">
-              <div>
-                <span>Assets</span>
-                <strong>{sourceAssets.length}</strong>
-              </div>
-              <div>
-                <span>Visible</span>
-                <strong>{filteredAssets.length}</strong>
-              </div>
-              <div>
-                <span>Selected</span>
-                <strong>{selectedIds.size}</strong>
-              </div>
-              <div>
-                <span>Missing</span>
-                <strong>{sourceAssets.filter((a) => a.status === 'missing').length}</strong>
-              </div>
-            </div>
-          </section>
+          <section className="panel-nav-section panel-nav-folders">
+            <button
+              className="section-head folder-section-toggle"
+              type="button"
+              aria-expanded={!folderSectionCollapsed}
+              onClick={() => setFolderSectionCollapsed((value) => !value)}
+            >
+              <h2>Folders</h2>
+              {folderSectionCollapsed ? <ChevronRight /> : <ChevronDown />}
+            </button>
+            <div className="folder-list">
+              {visibleFolderTreeNodes.map((item) => {
+                const itemCollapsed = collapsedFolderPaths.has(item.path)
+                const selectFolder = () => {
+                  setStatusFilter('')
+                  setSelectedFolderPath((current) =>
+                    current === item.path ? '' : item.path,
+                  )
+                }
 
-          <section className="section">
-            <div className="section-head">
-              <h2>Collections</h2>
-            </div>
-            <div className="favorite-list">
-              {stateDoc.favorites.map((collection) => (
-                <Button
-                  key={collection.id}
-                  className={cn(
-                    'collection-row',
-                    selectedCollectionFilters.includes(collection.id) && 'is-active',
-                  )}
-                  variant="ghost"
-                  type="button"
-                  onClick={() =>
-                    setSelectedCollectionFilters((current) =>
-                      toggleArrayValue(current, collection.id),
-                    )
-                  }
-                >
-                  <Star />
-                  <span>{collection.name}</span>
-                  <strong>{collection.entries.length}</strong>
-                </Button>
-              ))}
+                return (
+                  <div
+                    key={item.path}
+                    role="button"
+                    tabIndex={0}
+                    className={cn(
+                      'folder-row',
+                      selectedFolderPath === item.path && 'is-active',
+                      item.depth > 0 && 'is-nested',
+                    )}
+                    style={{ '--folder-depth': item.depth } as CSSProperties}
+                    onClick={selectFolder}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter' && event.key !== ' ') return
+                      event.preventDefault()
+                      selectFolder()
+                    }}
+                  >
+                    {item.hasChildren ? (
+                      <button
+                        className="folder-toggle"
+                        type="button"
+                        aria-label={itemCollapsed ? '展开子文件夹' : '收起子文件夹'}
+                        aria-expanded={!itemCollapsed}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          toggleFolderCollapsed(item.path)
+                        }}
+                      >
+                        {itemCollapsed ? <ChevronRight /> : <ChevronDown />}
+                      </button>
+                    ) : (
+                      <span className="folder-toggle is-leaf" aria-hidden="true">
+                        <FolderOpen />
+                      </span>
+                    )}
+                    <span>{item.name}</span>
+                    <strong>{item.count}</strong>
+                  </div>
+                )
+              })}
             </div>
           </section>
         </ScrollArea>
+        <div className="panel-footer">
+          <Button
+            className="generate-index"
+            type="button"
+            variant="ghost"
+            onClick={generateIndex}
+            disabled={Boolean(busy) || !supportsFileSystemAccess()}
+          >
+            <RefreshCw data-icon="inline-start" />
+            Generate Index
+          </Button>
+          {rootHandle && assets.length === 0 && (
+            <Button type="button" variant="ghost" onClick={loadMetadataManually}>
+              META
+            </Button>
+          )}
+        </div>
       </motion.aside>
       )}
       </AnimatePresence>
 
       <section className="viewport">
-        <header className="topbar">
+        <div className={workspaceClassName}>
+          <section
+            className={cn('asset-list', focusedAsset && 'has-preview')}
+            aria-label="Assets"
+          >
+        <div className="asset-list-toolbar">
           <div className="topbar-filters">
-            <div className="topbar-search">
-              <Search />
-              <Input
-                value={query}
-                placeholder="Search name / type / path"
-                aria-label="Search assets"
-                onChange={(event) => setQuery(event.target.value)}
-              />
+            <div className="topbar-search-row">
+              <div className="topbar-search">
+                <Search />
+                <Input
+                  value={query}
+                  placeholder="Search name / type / path"
+                  aria-label="Search assets"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
             </div>
-            <div className="topbar-filter-row">
-              <FilterGroupControl
-                title="Type"
-                count={selectedKindFilters.length}
-                selectedLabels={selectedKindFilters.map(getKindLabel)}
-                expanded={expandedFilterGroups.includes('type')}
-                onOpenChange={(open) => setFilterGroupOpen('type', open)}
-              >
-                {ASSET_KIND_FILTERS.map((kind) => (
-                  <FilterOptionButton
-                    key={kind}
-                    active={selectedKindFilters.includes(kind)}
-                    onClick={() =>
-                      setSelectedKindFilters((current) =>
-                        toggleArrayValue(current, kind),
-                      )
-                    }
-                  >
-                    {getKindLabel(kind)}
-                  </FilterOptionButton>
-                ))}
-              </FilterGroupControl>
-
-              <FilterGroupControl
-                title="Tag"
-                count={selectedTagFilters.length}
-                selectedLabels={selectedTagFilters}
-                expanded={expandedFilterGroups.includes('tag')}
-                onOpenChange={(open) => setFilterGroupOpen('tag', open)}
-              >
-                {tagOptions.length > 0 ? (
-                  tagOptions.map((tag) => (
+            <div className="topbar-search-divider" aria-hidden="true" />
+            <div className="topbar-filter-row topbar-filter-row-all">
+              <div className="topbar-filter-pills">
+                <FilterGroupControl
+                  title="Type"
+                  count={selectedKindFilters.length}
+                  selectedLabels={selectedKindFilters.map(getKindLabel)}
+                  expanded={expandedFilterGroups.includes('type')}
+                  onOpenChange={(open) => setFilterGroupOpen('type', open)}
+                >
+                  {ASSET_KIND_FILTERS.map((kind) => (
                     <FilterOptionButton
-                      key={tag}
-                      active={selectedTagFilters.includes(tag)}
+                      key={kind}
+                      active={selectedKindFilters.includes(kind)}
                       onClick={() =>
-                        setSelectedTagFilters((current) =>
-                          toggleArrayValue(current, tag),
+                        setSelectedKindFilters((current) =>
+                          toggleArrayValue(current, kind),
                         )
                       }
                     >
-                      {tag}
+                      {getKindLabel(kind)}
                     </FilterOptionButton>
-                  ))
-                ) : (
-                  <span className="filter-empty">No tags</span>
-                )}
-              </FilterGroupControl>
-
-              <FilterGroupControl
-                title="Collection"
-                count={selectedCollectionFilters.length}
-                selectedLabels={selectedCollectionFilters.map(
-                  (id) =>
-                    stateDoc.favorites.find((collection) => collection.id === id)
-                      ?.name ?? id,
-                )}
-                expanded={expandedFilterGroups.includes('collection')}
-                onOpenChange={(open) => setFilterGroupOpen('collection', open)}
+                  ))}
+                </FilterGroupControl>
+                <FilterGroupControl
+                  title="FileType"
+                  count={activeFileTypeFilters.length}
+                  selectedLabels={activeFileTypeFilters.map((extension) => `.${extension}`)}
+                  expanded={expandedFilterGroups.includes('filetype')}
+                  onOpenChange={(open) => setFilterGroupOpen('filetype', open)}
+                >
+                  {fileTypeOptions.length > 0 ? (
+                    fileTypeOptions.map((extension) => (
+                      <FilterOptionButton
+                        key={extension}
+                        active={activeFileTypeFilters.includes(extension)}
+                        onClick={() =>
+                          setSelectedFileTypeFilters((current) =>
+                            toggleArrayValue(current, extension),
+                          )
+                        }
+                      >
+                        .{extension}
+                      </FilterOptionButton>
+                    ))
+                  ) : (
+                    <span className="filter-empty">No file types</span>
+                  )}
+                </FilterGroupControl>
+                <FilterGroupControl
+                  title="Collection"
+                  count={selectedCollectionFilters.length}
+                  selectedLabels={selectedCollectionFilters.map(
+                    (id) =>
+                      stateDoc.favorites.find((collection) => collection.id === id)
+                        ?.name ?? id,
+                  )}
+                  expanded={expandedFilterGroups.includes('collection')}
+                  onOpenChange={(open) => setFilterGroupOpen('collection', open)}
+                >
+                  {stateDoc.favorites.map((collection) => (
+                    <FilterOptionButton
+                      key={collection.id}
+                      active={selectedCollectionFilters.includes(collection.id)}
+                      onClick={() =>
+                        setSelectedCollectionFilters((current) =>
+                          toggleArrayValue(current, collection.id),
+                        )
+                      }
+                    >
+                      {collection.name} ({collection.entries.length})
+                    </FilterOptionButton>
+                  ))}
+                </FilterGroupControl>
+                <FilterGroupControl
+                  title="Rating"
+                  count={selectedRatingFilters.length}
+                  selectedLabels={selectedRatingFilters.map((rating) => `${rating} 分`)}
+                  expanded={expandedFilterGroups.includes('rating')}
+                  onOpenChange={(open) => setFilterGroupOpen('rating', open)}
+                >
+                  {RATING_FILTERS.map((rating) => (
+                    <FilterOptionButton
+                      key={rating}
+                      active={selectedRatingFilters.includes(rating)}
+                      onClick={() =>
+                        setSelectedRatingFilters((current) =>
+                          toggleArrayValue(current, rating),
+                        )
+                      }
+                    >
+                      {rating} 分
+                    </FilterOptionButton>
+                  ))}
+                </FilterGroupControl>
+                <FilterGroupControl
+                  title="Tag"
+                  count={selectedTagFilters.length}
+                  selectedLabels={selectedTagFilters}
+                  expanded={expandedFilterGroups.includes('tag')}
+                  onOpenChange={(open) => setFilterGroupOpen('tag', open)}
+                >
+                  {tagOptions.length > 0 ? (
+                    tagOptions.map((tag) => (
+                      <FilterOptionButton
+                        key={tag}
+                        active={selectedTagFilters.includes(tag)}
+                        onClick={() =>
+                          setSelectedTagFilters((current) =>
+                            toggleArrayValue(current, tag),
+                          )
+                        }
+                      >
+                        {tag}
+                      </FilterOptionButton>
+                    ))
+                  ) : (
+                    <span className="filter-empty">No tags</span>
+                  )}
+                </FilterGroupControl>
+              </div>
+              <Button
+                className="reset-filters-icon"
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                title="Reset"
+                aria-label="Reset filters"
+                onClick={resetFilters}
               >
-                {stateDoc.favorites.map((collection) => (
-                  <FilterOptionButton
-                    key={collection.id}
-                    active={selectedCollectionFilters.includes(collection.id)}
-                    onClick={() =>
-                      setSelectedCollectionFilters((current) =>
-                        toggleArrayValue(current, collection.id),
-                      )
-                    }
-                  >
-                    {collection.name} ({collection.entries.length})
-                  </FilterOptionButton>
-                ))}
-              </FilterGroupControl>
-
-              <FilterGroupControl
-                title="Rating"
-                count={selectedRatingFilters.length}
-                selectedLabels={selectedRatingFilters.map((rating) => `${rating} 分`)}
-                expanded={expandedFilterGroups.includes('rating')}
-                onOpenChange={(open) => setFilterGroupOpen('rating', open)}
-              >
-                {RATING_FILTERS.map((rating) => (
-                  <FilterOptionButton
-                    key={rating}
-                    active={selectedRatingFilters.includes(rating)}
-                    onClick={() =>
-                      setSelectedRatingFilters((current) =>
-                        toggleArrayValue(current, rating),
-                      )
-                    }
-                  >
-                    {rating} 分
-                  </FilterOptionButton>
-                ))}
-              </FilterGroupControl>
+                <RefreshCw />
+              </Button>
             </div>
           </div>
-        </header>
-
-        <div className={workspaceClassName}>
-          <section className="asset-list" aria-label="Assets">
-            <div className="asset-list-head">
-              <span className="asset-select-head">
-                <Checkbox
-                  className="select-checkbox"
-                  checked={
-                    allFilteredSelected
-                      ? true
-                      : selectedFilteredCount > 0
-                        ? 'indeterminate'
-                        : false
-                  }
-                  disabled={filteredAssetIds.length === 0}
-                  aria-label="Select all visible assets"
-                  onCheckedChange={toggleFilteredSelection}
-                />
-              </span>
-              <span className="asset-name-head">Name</span>
-              <span className="asset-middle-head">
-                <span>Type</span>
-                <span>Rating</span>
-                <span>Path</span>
-                <span>Status</span>
-              </span>
-              <span className="asset-tag-head">Tag</span>
-              <span className="asset-actions-head">Actions</span>
-            </div>
-            <ScrollArea className="asset-rows">
-              <AnimatePresence initial={false}>
-              {filteredAssets.map((asset) => (
-                (() => {
-                  const displayTags = Array.from(new Set([
-                    ...asset.tags,
-                    ...(stateDoc.assetTags[asset.id] ?? []),
-                  ]))
-                  const visibleTagLimit = displayTags.length > 2 ? 2 : 3
-                  const visibleTags = displayTags.slice(0, visibleTagLimit)
-                  const hiddenTagCount = Math.max(displayTags.length - visibleTags.length, 0)
-                  const primaryCollection = stateDoc.favorites[0]
-                  return (
-                <motion.div
-                  key={asset.id}
-                  layout
-                  role="button"
-                  tabIndex={0}
-                  className={cn('asset-row', asset.id === focusedId && 'is-focused')}
-                  initial={{ opacity: 0, y: 4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
-                  transition={{ duration: 0.12, ease: 'easeOut' }}
-                  onClick={() => {
-                    activateAsset(asset)
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault()
-                      activateAsset(asset)
-                    }
-                  }}
-                  onMouseEnter={() => {
-                    if (previewMode !== 'hover') return
-                    if (asset.kind === 'audio') {
-                      requestAudioPlayback(asset.id)
-                      return
-                    }
-                    setActiveAudioId('')
-                    if (!previewLocked && isPreviewPaneAsset(asset)) {
-                      setPreviewAssetId(asset.id)
-                    }
-                  }}
-                  onMouseLeave={() => {
-                    if (previewMode !== 'hover') return
-                    if (asset.kind === 'audio') setActiveAudioId('')
-                    if (!previewLocked) setPreviewAssetId('')
-                  }}
-                >
+        </div>
+            <div
+              className={cn(
+                'asset-table-scroll',
+                tableScrollStateForScope.canScrollLeft && 'can-scroll-left',
+                tableScrollStateForScope.canScrollRight && 'can-scroll-right',
+              )}
+              ref={tableScrollRef}
+              onScroll={(event) => {
+                updateTableScrollState()
+                setAssetScrollState({
+                  key: virtualScopeKey,
+                  top: event.currentTarget.scrollTop,
+                  height: event.currentTarget.clientHeight,
+                })
+              }}
+              onWheel={(event) => {
+                const element = tableScrollRef.current
+                if (!element) return
+                const delta =
+                  event.deltaX !== 0
+                    ? event.deltaX
+                    : event.shiftKey
+                      ? event.deltaY
+                      : 0
+                if (!delta) return
+                element.scrollLeft += delta
+                updateTableScrollState()
+                event.preventDefault()
+              }}
+            >
+              <div className="asset-list-head">
+                <span className="asset-select-head asset-sticky asset-sticky-select">
                   <Checkbox
-                    className="row-check"
-                    checked={selectedIds.has(asset.id)}
-                    onClick={(event) => {
-                      event.stopPropagation()
+                    className="select-checkbox"
+                    checked={
+                      allFilteredSelected
+                        ? true
+                        : selectedFilteredCount > 0
+                          ? 'indeterminate'
+                          : false
+                    }
+                    disabled={visibleAssetIds.length === 0}
+                    aria-label="Select all visible assets"
+                    onCheckedChange={toggleFilteredSelection}
+                  />
+                </span>
+                <span className="asset-name-head asset-sticky asset-sticky-name">
+                  <button
+                    className="asset-head-button"
+                    type="button"
+                    onClick={() => toggleSort('name')}
+                  >
+                    <span>Name</span>
+                    {sortIndicator('name')}
+                  </button>
+                </span>
+                <span className="asset-middle-head">
+                  <button
+                    className="asset-head-button is-center"
+                    type="button"
+                    onClick={() => toggleSort('type')}
+                  >
+                    <span>Type</span>
+                    {sortIndicator('type')}
+                  </button>
+                  <button
+                    className="asset-head-button"
+                    type="button"
+                    onClick={() => toggleSort('filetype')}
+                  >
+                    <span>FileType</span>
+                    {sortIndicator('filetype')}
+                  </button>
+                  <button
+                    className="asset-head-button is-right"
+                    type="button"
+                    onClick={() => toggleSort('size')}
+                  >
+                    <span>Size</span>
+                    {sortIndicator('size')}
+                  </button>
+                  <button
+                    className="asset-head-button is-right"
+                    type="button"
+                    onClick={() => toggleSort('createdAt')}
+                  >
+                    <span>Created</span>
+                    {sortIndicator('createdAt')}
+                  </button>
+                  <button
+                    className="asset-head-button is-right"
+                    type="button"
+                    onClick={() => toggleSort('updatedAt')}
+                  >
+                    <span>Modified</span>
+                    {sortIndicator('updatedAt')}
+                  </button>
+                  <button
+                    className="asset-head-button"
+                    type="button"
+                    onClick={() => toggleSort('rating')}
+                  >
+                    <span>Rating</span>
+                    {sortIndicator('rating')}
+                  </button>
+                  <button
+                    className="asset-head-button"
+                    type="button"
+                    onClick={() => toggleSort('tag')}
+                  >
+                    <span>Tag</span>
+                    {sortIndicator('tag')}
+                  </button>
+                </span>
+                <span className="asset-actions-head asset-sticky asset-sticky-actions">
+                  Actions
+                </span>
+              </div>
+              <div
+                key={virtualScopeKey}
+                className="asset-rows"
+              >
+                <div
+                  className="asset-virtual-spacer"
+                  style={{ height: virtualTopHeight }}
+                  aria-hidden="true"
+                />
+                {renderedAssets.map((asset) => (
+                  (() => {
+                    const displayTags = Array.from(new Set([
+                      ...asset.tags,
+                      ...(stateDoc.assetTags[asset.id] ?? []),
+                    ]))
+                    const removableTags = new Set(stateDoc.assetTags[asset.id] ?? [])
+                    const composerOpen = tagComposerAssetId === asset.id
+
+                    return (
+                  <div
+                    key={asset.id}
+                    role="button"
+                    tabIndex={0}
+                    className={cn(
+                      'asset-row',
+                      asset.id === focusedId && 'is-focused',
+                      selectedIds.has(asset.id) && 'is-selected',
+                    )}
+                    onClick={() => {
+                      activateAsset(asset)
                     }}
                     onKeyDown={(event) => {
-                      event.stopPropagation()
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        activateAsset(asset)
+                      }
                     }}
-                    onCheckedChange={() => {
-                      toggleSelected(asset.id)
-                    }}
-                    aria-label={`Select ${asset.name}`}
-                  />
-                  <span className="asset-name">
-                    <strong>{asset.name}</strong>
-                    {asset.kind === 'audio' ? (
-                      <InlineAudioPlayer
-                        asset={asset}
-                        active={activeAudioId === asset.id}
-                        playSignal={activeAudioId === asset.id ? audioPlaySignal : 0}
-                        previewMode={previewMode}
-                        onActivate={() => requestAudioPlayback(asset.id)}
-                        onInteract={() => setPreviewAssetId('')}
-                      />
-                    ) : null}
-                  </span>
-                  <span className="asset-middle">
-                    <KindIconBadge kind={asset.kind} />
-                    <RatingControl
-                      rating={stateDoc.assetRatings[asset.id] ?? 0}
-                      onRate={(rating) => updateAssetRating(asset, rating)}
-                    />
-                    <span className="asset-path">{asset.normalizedPath || asset.reference}</span>
-                    <Badge className={cn('status-pill', `is-${asset.status}`)} variant="outline">
-                      {asset.status}
-                    </Badge>
-                  </span>
-                  <span className="row-tags" onClick={(event) => event.stopPropagation()}>
-                    {visibleTags.map((tag) => {
-                      const removable = stateDoc.assetTags[asset.id]?.includes(tag)
-                      return (
-                        <button
-                          key={tag}
-                          className={cn('tag-pill', removable && 'is-removable')}
-                          type="button"
-                          title={removable ? `移除 ${tag}` : tag}
-                          onClick={() => removable && removeAssetTag(asset, tag)}
-                        >
-                          {tag}
-                        </button>
-                      )
-                    })}
-                    {hiddenTagCount > 0 && (
-                      <span className="tag-pill is-overflow">+{hiddenTagCount}</span>
-                    )}
-                    <label className="tag-add-pill">
-                      <Plus />
-                      <input
-                        value={tagDrafts[asset.id] ?? ''}
-                        list="asset-tag-options"
-                        placeholder="Tag"
-                        aria-label={`Add tag to ${asset.name}`}
-                        onChange={(event) =>
-                          setTagDrafts((current) => ({
-                            ...current,
-                            [asset.id]: event.target.value,
-                          }))
-                        }
-                        onKeyDown={(event) => {
-                          if (event.key !== 'Enter') return
-                          event.preventDefault()
-                          addAssetTag(asset, event.currentTarget.value)
+                  >
+                    <span className="asset-select-cell asset-sticky asset-sticky-select">
+                      <Checkbox
+                        className="row-check"
+                        checked={selectedIds.has(asset.id)}
+                        onClick={(event) => {
+                          event.stopPropagation()
                         }}
-                        onBlur={(event) => addAssetTag(asset, event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          event.stopPropagation()
+                        }}
+                        onCheckedChange={() => {
+                          toggleSelected(asset.id)
+                        }}
+                        aria-label={`Select ${asset.name}`}
                       />
-                    </label>
-                  </span>
-                  <span className="row-actions" onClick={(event) => event.stopPropagation()}>
-                    <ToolbarIconButton
-                      label="重命名"
-                      onClick={() => renameAsset(asset)}
-                      disabled={!asset.fileHandle}
-                    >
-                      <Type />
-                    </ToolbarIconButton>
-                    <ToolbarIconButton
-                      label="下载"
-                      onClick={() => downloadAsset(asset)}
-                    >
-                      <Download />
-                    </ToolbarIconButton>
-                    {primaryCollection && (
-                      <ToolbarIconButton
-                        label={`收藏到${primaryCollection.name}`}
-                        active={isAssetInCollection(asset.id, primaryCollection.id)}
-                        className="favorite-action"
-                        onClick={() => toggleFavoriteCollection(asset, primaryCollection.id)}
+                    </span>
+                    <span className="asset-name asset-sticky asset-sticky-name">
+                      <strong>{asset.name}</strong>
+                      <span
+                        className="asset-path"
+                        title={asset.normalizedPath || asset.reference}
                       >
-                        <Star />
+                        {asset.normalizedPath || asset.reference}
+                      </span>
+                    </span>
+                    <span className="asset-middle">
+                      <KindIconBadge asset={asset} />
+                      <span className="filetype-ext">{formatFileExtension(asset)}</span>
+                      <span className="asset-size">{formatFileSize(asset.size)}</span>
+                      <span
+                        className="asset-date"
+                        title={formatDateTime(asset.createdAt)}
+                      >
+                        {formatDateShort(asset.createdAt)}
+                      </span>
+                      <span
+                        className="asset-date"
+                        title={formatDateTime(asset.updatedAt)}
+                      >
+                        {formatDateShort(asset.updatedAt)}
+                      </span>
+                      <RatingControl
+                        rating={stateDoc.assetRatings[asset.id] ?? 0}
+                        onRate={(rating) => updateAssetRating(asset, rating)}
+                      />
+                      <span className="row-tags" onClick={(event) => event.stopPropagation()}>
+                        {displayTags.map((tag) => (
+                          <DropdownMenu key={tag}>
+                            <DropdownMenuTrigger
+                              className={cn(
+                                'tag-pill',
+                                removableTags.has(tag) && 'is-removable',
+                              )}
+                              type="button"
+                              title={tag}
+                            >
+                              <span className="tag-text">{tag}</span>
+                              {removableTags.has(tag) && (
+                                <span
+                                  className="tag-remove"
+                                  title="Remove"
+                                  onPointerDown={(event) => {
+                                    event.preventDefault()
+                                    event.stopPropagation()
+                                  }}
+                                  onClick={(event) => {
+                                    event.preventDefault()
+                                    event.stopPropagation()
+                                    removeAssetTag(asset, tag)
+                                  }}
+                                >
+                                  <X />
+                                </span>
+                              )}
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="start" side="top">
+                              <DropdownMenuItem
+                                onSelect={() => {
+                                  setSelectedTagFilters((current) =>
+                                    toggleArrayValue(current, tag),
+                                  )
+                                }}
+                              >
+                                {selectedTagFilters.includes(tag)
+                                  ? '取消 Tag 筛选'
+                                  : '按此 Tag 筛选'}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        ))}
+                        <DropdownMenu
+                          open={composerOpen}
+                          onOpenChange={(open) => {
+                            if (assets.length === 0) {
+                              log('warn', '模板资源暂不支持修改标签。请先打开真实文件夹。')
+                              return
+                            }
+                            if (open) {
+                              setTagComposerAssetId(asset.id)
+                              setTagComposerValue('')
+                              return
+                            }
+                            if (tagComposerAssetId === asset.id) {
+                              setTagComposerAssetId('')
+                              setTagComposerValue('')
+                            }
+                          }}
+                        >
+                          <DropdownMenuTrigger
+                            className="tag-pill tag-pill-add"
+                            type="button"
+                            title="Add tag"
+                          >
+                            <Plus />
+                            <span className="tag-text">Tag</span>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start" side="top">
+                            <div
+                              className="tag-compose"
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              <Input
+                                value={composerOpen ? tagComposerValue : ''}
+                                placeholder="输入新 Tag"
+                                autoFocus
+                                onChange={(event) =>
+                                  setTagComposerValue(event.target.value)
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape') {
+                                    event.preventDefault()
+                                    setTagComposerAssetId('')
+                                    setTagComposerValue('')
+                                    return
+                                  }
+                                  if (event.key !== 'Enter') return
+                                  event.preventDefault()
+                                  addAssetTag(asset, tagComposerValue)
+                                  setTagComposerAssetId('')
+                                  setTagComposerValue('')
+                                }}
+                              />
+                            </div>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </span>
+                    </span>
+                    <span className="row-actions asset-sticky asset-sticky-actions" onClick={(event) => event.stopPropagation()}>
+                      <ToolbarIconButton
+                        label="重命名"
+                        onClick={() => renameAsset(asset)}
+                        disabled={!asset.fileHandle}
+                      >
+                        <Pencil />
                       </ToolbarIconButton>
-                    )}
-                    <ToolbarIconButton
-                      label="删除"
-                      danger
-                      onClick={() => deleteAsset(asset)}
-                      disabled={!asset.fileHandle}
-                    >
-                      <Trash2 />
-                    </ToolbarIconButton>
-                  </span>
-                </motion.div>
-                  )
-                })()
-              ))}
-              </AnimatePresence>
-              <datalist id="asset-tag-options">
-                {tagOptions.map((tag) => (
-                  <option key={tag} value={tag} />
+                      <ToolbarIconButton
+                        label="下载"
+                        onClick={() => downloadAsset(asset)}
+                      >
+                        <Download />
+                      </ToolbarIconButton>
+                      <ToolbarIconButton
+                        label="删除"
+                        danger
+                        onClick={() => deleteAsset(asset)}
+                        disabled={!asset.fileHandle}
+                      >
+                        <Trash2 />
+                      </ToolbarIconButton>
+                    </span>
+                  </div>
+                    )
+                  })()
                 ))}
-              </datalist>
-              {filteredAssets.length === 0 && (
-                <div className="empty-list">No assets</div>
+                <div
+                  className="asset-virtual-spacer"
+                  style={{ height: virtualBottomHeight }}
+                  aria-hidden="true"
+                />
+                <datalist id="asset-tag-options">
+                  {tagOptions.map((tag) => (
+                    <option key={tag} value={tag} />
+                  ))}
+                </datalist>
+                {visibleAssets.length === 0 && (
+                  <div className="empty-list">No assets</div>
+                )}
+              </div>
+            </div>
+            <AnimatePresence initial={false}>
+              {focusedAsset && (
+                <motion.div
+                  className="asset-preview-card"
+                  initial={{ opacity: 0, x: 10 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 10 }}
+                  transition={{ duration: 0.16, ease: 'easeOut' }}
+                >
+                  <PreviewPane
+                    asset={focusedAsset}
+                    history={stateDoc.history}
+                    fileIndex={fileIndex}
+                    onClose={() => setFocusedId('')}
+                  />
+                </motion.div>
               )}
-            </ScrollArea>
+            </AnimatePresence>
+            <AnimatePresence initial={false}>
+              {selectedIds.size > 0 && (
+                <motion.div
+                  className="selection-bar"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.16, ease: 'easeOut' }}
+                >
+                  <span>{selectedIds.size} selected</span>
+                  <Button
+                    className="selection-clear"
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setSelectedIds(new Set())}
+                    aria-label="Clear selection"
+                  >
+                    ×
+                  </Button>
+                  <span className="selection-divider" />
+                  <Button type="button" variant="ghost" onClick={downloadSelectedAssets}>
+                    <Download data-icon="inline-start" />
+                    Download
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={deleteSelectedAssets}>
+                    <Trash2 data-icon="inline-start" />
+                    Delete
+                  </Button>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </section>
-
-          <AnimatePresence initial={false}>
-            {showPreviewPane && (
-              <PreviewPane
-                asset={previewableAsset}
-                history={stateDoc.history}
-                fileIndex={fileIndex.byPath}
-              />
-            )}
-          </AnimatePresence>
         </div>
 
-        <motion.div
-          className={cn('log-dock', activityCollapsed && 'is-collapsed')}
-          layout
-          transition={{ duration: 0.16, ease: 'easeOut' }}
-        >
+        <div className={cn('log-dock', activityCollapsed && 'is-collapsed')}>
           <div className="log-head">
-            <span>Activity</span>
-            <ToolbarIconButton
-              label={activityCollapsed ? '展开 Activity' : '收起 Activity'}
+            <Button
+              className="log-toggle"
+              type="button"
+              variant="ghost"
               aria-label={activityCollapsed ? '展开 Activity' : '收起 Activity'}
               onClick={() => setActivityCollapsed((value) => !value)}
             >
+              <span>Log</span>
               {activityCollapsed ? <ChevronUp /> : <ChevronDown />}
-            </ToolbarIconButton>
+            </Button>
           </div>
           <AnimatePresence initial={false}>
           {!activityCollapsed && (
@@ -1305,22 +1971,22 @@ function App() {
             </motion.div>
           )}
           </AnimatePresence>
-        </motion.div>
+        </div>
       </section>
     </motion.main>
     </TooltipProvider>
   )
 }
 
-function KindIconBadge({ kind }: { kind: AssetKind }) {
-  const Icon = KIND_ICON_COMPONENTS[kind]
+function KindIconBadge({ asset }: { asset: AssetRecord }) {
+  const Icon = KIND_ICON_COMPONENTS[asset.kind]
 
   return (
     <Badge
-      className={cn('kind-dot', `is-${kind}`)}
+      className={cn('kind-dot', `is-${asset.kind}`)}
       variant="secondary"
-      title={getKindLabel(kind)}
-      aria-label={getKindLabel(kind)}
+      title={formatAssetKind(asset)}
+      aria-label={formatAssetKind(asset)}
     >
       <Icon />
     </Badge>
@@ -1333,6 +1999,8 @@ function FilterGroupControl({
   selectedLabels,
   expanded,
   onOpenChange,
+  className,
+  triggerClassName,
   children,
 }: {
   title: string
@@ -1340,16 +2008,27 @@ function FilterGroupControl({
   selectedLabels?: string[]
   expanded: boolean
   onOpenChange: (open: boolean) => void
+  className?: string
+  triggerClassName?: string
   children: ReactNode
 }) {
   const visibleLabels = (selectedLabels ?? []).slice(0, 2)
   const overflowCount = Math.max(count - visibleLabels.length, 0)
 
   return (
-    <Popover open={expanded} onOpenChange={onOpenChange}>
-      <section className={cn('filter-group', expanded && 'is-expanded')}>
-        <PopoverTrigger asChild>
-          <Button className="filter-group-trigger" variant="outline" type="button">
+    <DropdownMenu open={expanded} onOpenChange={onOpenChange}>
+      <section className={cn('filter-group', expanded && 'is-expanded', className)}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            className={cn(
+              'filter-group-trigger',
+              '!h-6 !justify-start !px-2 !text-[11px]',
+              triggerClassName,
+            )}
+            variant="outline"
+            size="xs"
+            type="button"
+          >
             <span className="filter-title">{title}</span>
             {visibleLabels.length > 0 && (
               <span className="filter-selected">
@@ -1363,14 +2042,13 @@ function FilterGroupControl({
                 )}
               </span>
             )}
-            {expanded ? <ChevronUp /> : <ChevronDown />}
           </Button>
-        </PopoverTrigger>
-        <PopoverContent className="filter-options" align="start">
+        </DropdownMenuTrigger>
+        <DropdownMenuContent className="filter-options" align="start">
           {children}
-        </PopoverContent>
+        </DropdownMenuContent>
       </section>
-    </Popover>
+    </DropdownMenu>
   )
 }
 
@@ -1448,12 +2126,58 @@ function ToolbarIconButton({
   )
 }
 
-function stripExtension(filename: string) {
-  return filename.replace(/\.[^.]+$/, '')
+function formatAssetKind(asset: AssetRecord) {
+  if (
+    asset.kind === 'model' &&
+    [...asset.tags, asset.typeLabel, ...Object.values(asset.metadata)]
+      .join(' ')
+      .toLocaleLowerCase()
+      .includes('anim')
+  ) {
+    return 'Animation'
+  }
+
+  const labels: Record<AssetKind, string> = {
+    image: 'Image',
+    audio: 'Audio',
+    video: 'Video',
+    model: 'Model',
+    document: 'Document',
+    unknown: 'Unknown',
+  }
+
+  return labels[asset.kind]
 }
 
-function isPreviewPaneAsset(asset: AssetRecord) {
-  return asset.kind === 'image' || asset.kind === 'video' || asset.kind === 'model'
+function formatFileExtension(asset: AssetRecord) {
+  const raw =
+    asset.extension ||
+    (asset.normalizedPath || asset.reference || '').split('.').pop() ||
+    ''
+  if (!raw) return '-'
+  return `.${raw.toLocaleLowerCase()}`
+}
+
+function formatFileSize(size?: number) {
+  if (!size) return '—'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = size
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value >= 10 || unitIndex === 0 ? Math.round(value) : value.toFixed(1)} ${units[unitIndex]}`
+}
+
+function formatDateShort(value?: number) {
+  if (value == null) return '—'
+  return new Date(value).toISOString().slice(0, 10)
+}
+
+function formatDateTime(value?: number) {
+  if (value == null) return ''
+  return new Date(value).toLocaleString()
 }
 
 function isUserAbort(error: unknown) {

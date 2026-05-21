@@ -13,6 +13,10 @@ type FileIndex = {
   byBasename: Map<string, IndexedFile[]>
 }
 
+type ParseManifestOptions = {
+  resolveFiles?: boolean
+}
+
 const TYPE_BY_EXTENSION: Record<string, AssetKind> = {
   png: 'image',
   jpg: 'image',
@@ -35,6 +39,7 @@ const TYPE_BY_EXTENSION: Record<string, AssetKind> = {
   obj: 'model',
   stl: 'model',
   fbx: 'model',
+  vox: 'model',
   pdf: 'document',
   txt: 'document',
   md: 'document',
@@ -45,7 +50,7 @@ const TYPE_WORDS: Array<[RegExp, AssetKind]> = [
   [/image|img|picture|texture|sprite|贴图|图片|图像/i, 'image'],
   [/audio|sound|music|voice|音频|声音|音乐/i, 'audio'],
   [/video|movie|clip|视频|影片|动画视频/i, 'video'],
-  [/model|mesh|gltf|glb|fbx|obj|3d|三维|模型|动画/i, 'model'],
+  [/model|mesh|gltf|glb|fbx|obj|vox|voxel|magicavoxel|3d|三维|模型|体素|动画/i, 'model'],
   [/doc|text|pdf|document|文档/i, 'document'],
 ]
 
@@ -92,19 +97,24 @@ const FIELD_ALIASES = {
     '文件路径',
   ],
   tags: ['tags', 'tag', 'labels', 'keywords', '标签', '关键词'],
+  size: ['size', 'sizemb', 'sizeinmb', '大小', '文件大小'],
+  createdAt: ['createdat', 'created', 'creationdate', 'createddate', 'ctime', '创建日期', '创建时间'],
+  updatedAt: ['updatedat', 'modifiedat', 'lastmodified', 'mtime', '修改日期', '修改时间', '最后修改日期', '最后修改时间'],
 }
 
 export async function parseManifest(
   manifest: ManifestSource,
   fileIndex: FileIndex,
+  options: ParseManifestOptions = {},
 ) {
+  const { resolveFiles = true } = options
   const rows = manifest.kind === 'csv'
     ? await parseCsv(manifest.file)
     : await parseWorkbook(manifest.file)
 
   const normalizedRows: AssetRecord[] = []
   rows.forEach((row, rowIndex) => {
-    const asset = normalizeRow(row, rowIndex, fileIndex)
+    const asset = normalizeRow(row, rowIndex, fileIndex, { resolveFiles })
     if (asset) normalizedRows.push(asset)
   })
   return normalizedRows
@@ -141,6 +151,7 @@ function normalizeRow(
   row: Record<string, unknown>,
   rowIndex: number,
   fileIndex: FileIndex,
+  options: Required<ParseManifestOptions>,
 ): AssetRecord | null {
   const keys = Object.keys(row)
   if (keys.length === 0) return null
@@ -150,13 +161,16 @@ function normalizeRow(
     type: pickField(row, FIELD_ALIASES.type),
     reference: pickField(row, FIELD_ALIASES.reference),
     tags: pickField(row, FIELD_ALIASES.tags),
+    size: pickField(row, FIELD_ALIASES.size),
+    createdAt: pickField(row, FIELD_ALIASES.createdAt),
+    updatedAt: pickField(row, FIELD_ALIASES.updatedAt),
   }
 
   const reference = fields.reference || findReferenceFallback(row)
   if (!reference) return null
 
   const normalizedPath = normalizeAssetPath(reference)
-  const indexedFile = isExternalReference(reference)
+  const indexedFile = !options.resolveFiles || isExternalReference(reference)
     ? undefined
     : resolveIndexedFile(reference, fileIndex)
   const extension = getExtension(indexedFile?.path || normalizedPath)
@@ -176,7 +190,9 @@ function normalizeRow(
     ? 'external'
     : indexedFile
       ? 'ready'
-      : 'missing'
+      : options.resolveFiles
+        ? 'missing'
+        : 'ready'
 
   return {
     id: stableId(`${displayName}:${reference}:${rowIndex}`),
@@ -187,12 +203,15 @@ function normalizeRow(
     normalizedPath: indexedFile?.path || normalizedPath,
     folder: folderName(indexedFile?.path || normalizedPath),
     extension,
+    size: parseSizeBytes(fields.size),
     sourceRow: rowIndex + 2,
     tags: splitTags(fields.tags),
     metadata,
     status,
     isExternal: isExternalReference(reference),
     fileHandle: indexedFile?.handle,
+    createdAt: parseDateTime(fields.createdAt),
+    updatedAt: parseDateTime(fields.updatedAt),
   }
 }
 
@@ -251,6 +270,34 @@ function normalizeKey(value: string) {
   return Array.from(value.toLocaleLowerCase())
     .filter((char) => !ignored.has(char))
     .join('')
+}
+
+function parseSizeBytes(value: string) {
+  if (!value) return undefined
+  const normalized = value.replace(/,/g, '').trim().toLocaleLowerCase()
+  const match = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/.exec(normalized)
+  if (!match) return undefined
+
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount)) return undefined
+
+  const unit = match[2] ?? 'mb'
+  const multiplier =
+    unit === 'gb'
+      ? 1024 * 1024 * 1024
+      : unit === 'kb'
+        ? 1024
+        : unit === 'b'
+          ? 1
+          : 1024 * 1024
+
+  return Math.round(amount * multiplier)
+}
+
+function parseDateTime(value: string) {
+  if (!value) return undefined
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : undefined
 }
 
 export function isExternalReference(value: string) {
