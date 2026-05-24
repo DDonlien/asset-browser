@@ -1,0 +1,27 @@
+{
+  "id": "ab_example_asset_id",
+  "name": "example-texture.png",
+  "kind": "image",
+  "typeLabel": "image",
+  "reference": "Textures/example-texture.png",
+  "normalizedPath": "Textures/example-texture.png",
+  "folder": "Textures",
+  "extension": "png",
+  "size": 2457600,
+  "mime": "image/png",
+  "status": "ready",
+  "sourceRow": 2,
+  "tags": [
+    "example",
+    "texture"
+  ],
+  "metadata": {
+    "filetype": "PNG",
+    "sizeMB": "2.344",
+    "collection": "Textures",
+    "sourceManifest": "asset-browser-index.csv"
+  },
+  "isExternal": false,
+  "createdAt": 1768867200000,
+  "updatedAt": 1768867200000
+}

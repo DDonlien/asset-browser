@@ -48,6 +48,7 @@
 
 1. 顶部搜索与筛选器（Topbar）
 - Search：按名称/路径/标签等进行文本匹配搜索（用于快速定位）。
+- 布局：Search + Type / Collection / Rating + Reset（图标按钮）同一行；该行下方保留一条分隔线；Tag 过滤器位于分隔线下方并左对齐；Tag 下方不额外显示分隔线。
 - Type 筛选：按资产类型过滤（如 image/audio/video/model/document/unknown 等）。
 - Tag 筛选：按标签过滤（支持多选；以弹出面板形式选择）。
 - Collection 筛选：按集合过滤（支持多选；与左侧集合列表联动）。
@@ -111,4 +112,3 @@
 4. 底部活动日志抽屉（Activity Dock）
 - 抽屉头部：Activity 标题与折叠/展开控制。
 - 日志列表：按级别展示系统消息、错误与操作反馈；空态显示 Ready. 等状态提示。
-
